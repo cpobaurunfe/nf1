@@ -25,6 +25,7 @@ const https = require('node:https')
 const http = require('node:http')
 const crypto = require('node:crypto')
 const url = require('node:url')
+const zlib = require('node:zlib')
 
 const PORT = Number(process.env.PORT) || 8080
 const PROXY_SECRET = process.env.PROXY_SECRET || process.env.SEFAZ_PROXY_SECRET || ''
@@ -576,11 +577,78 @@ function createProxyServer() {
           })
 
           sefazRes.on('end', () => {
+            // Se a resposta contiver docZip, descomprime cada um via zlib.gunzipSync
+            const docs = []
+            if (responseBody.includes('<docZip') || responseBody.includes(':docZip')) {
+              try {
+                // Regex para capturar tags <docZip NSU="..." schema="...">base64</docZip>
+                // Pode vir com atributos NSU e schema em qualquer ordem, ou tags filhas em variações
+                const docZipRegex = /<(?:\w+:)?docZip\b([^>]*)>([\s\S]*?)<\/(?:\w+:)?docZip>/gi
+                let match
+                while ((match = docZipRegex.exec(responseBody)) !== null) {
+                  const attrsStr = match[1] || ''
+                  const contentBase64 = (match[2] || '').trim()
+
+                  let nsu = ''
+                  let schema = ''
+
+                  const nsuAttrMatch = attrsStr.match(/\bNSU=["']([^"']+)["']/i)
+                  if (nsuAttrMatch) {
+                    nsu = nsuAttrMatch[1]
+                  } else {
+                    const nsuChildMatch = attrsStr.match(/<(?:\w+:)?nsu>([^<]+)<\/(?:\w+:)?nsu>/i)
+                    if (nsuChildMatch) {
+                      nsu = nsuChildMatch[1]
+                    } else {
+                      const nsuTagMatch = contentBase64.match(
+                        /<(?:\w+:)?nsu>([^<]+)<\/(?:\w+:)?nsu>/i,
+                      )
+                      if (nsuTagMatch) nsu = nsuTagMatch[1]
+                    }
+                  }
+
+                  const schemaAttrMatch = attrsStr.match(/\bschema=["']([^"']+)["']/i)
+                  if (schemaAttrMatch) {
+                    schema = schemaAttrMatch[1]
+                  } else {
+                    const schemaTagMatch = contentBase64.match(
+                      /<(?:\w+:)?schema>([^<]+)<\/(?:\w+:)?schema>/i,
+                    )
+                    if (schemaTagMatch) schema = schemaTagMatch[1]
+                  }
+
+                  // Limpa qualquer tag interna que tenha ficado se o formato for <docZip><nsu>..</nsu>base64</docZip>
+                  let cleanB64 = contentBase64.replace(/<[^>]+>/g, '').replace(/\s+/g, '')
+
+                  if (cleanB64) {
+                    try {
+                      const gzBuffer = Buffer.from(cleanB64, 'base64')
+                      const unzipped = zlib.gunzipSync(gzBuffer)
+                      const xml = unzipped.toString('utf-8')
+                      docs.push({
+                        nsu: nsu,
+                        schema: schema,
+                        xml: xml,
+                      })
+                    } catch (unzipErr) {
+                      console.error(
+                        '[SEFAZ Proxy] Erro ao descomprimir docZip NSU ' + nsu + ':',
+                        unzipErr.message,
+                      )
+                    }
+                  }
+                }
+              } catch (parseDocErr) {
+                console.error('[SEFAZ Proxy] Erro no parsing de docZip:', parseDocErr.message)
+              }
+            }
+
             finishOnce(200, {
               success: true,
               statusCode: sefazRes.statusCode,
               headers: sefazRes.headers,
               body: responseBody,
+              docs: docs,
             })
           })
         })
