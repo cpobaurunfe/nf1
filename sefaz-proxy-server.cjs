@@ -89,6 +89,7 @@ const ALLOWED_EXACT_HOSTS = new Set([
   'hom.nfe.fazenda.gov.br',
   'nfe.fazenda.gov.br',
   'hom1.nfe.fazenda.gov.br',
+  'www.nfe.fazenda.gov.br',
   'nfe.fazenda.sp.gov.br',
   'homologacao.nfe.fazenda.sp.gov.br',
   'nfe.sefaz.rs.gov.br',
@@ -459,6 +460,34 @@ function createProxyServer() {
         // Diagnóstico sem jamais expor passphrase ou certificado
         const rawMsg = agentErr ? agentErr.message || String(agentErr) : ''
         const lowerMsg = rawMsg.toLowerCase()
+
+        // Detecção com precedência absoluta para cifras legadas (RC2/3DES PBES1) bloqueadas pelo OpenSSL 3
+        const isLegacyCipher =
+          lowerMsg.includes('unsupported pkcs12 pfx data') ||
+          lowerMsg.includes('unsupported pkcs12') ||
+          lowerMsg.includes('pkcs12 routines:pkcs12_pbe_crypt:unsupported') ||
+          lowerMsg.includes('pkcs12_pbe_crypt') ||
+          (lowerMsg.includes('unsupported') && lowerMsg.includes('pkcs12')) ||
+          (lowerMsg.includes('legacy') && lowerMsg.includes('provider'))
+
+        if (isLegacyCipher) {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' })
+          return res.end(
+            JSON.stringify({
+              success: false,
+              error:
+                'O certificado digital A1 utiliza criptografia legada (RC2/3DES PBES1) que o OpenSSL 3 bloqueia por padrão. ' +
+                'Para resolver, acerte no Render.com: Settings → Environment → Add Environment Variable → ' +
+                'Name: NODE_OPTIONS | Value: --openssl-legacy-provider → Save Changes → Manual Deploy → "Deploy latest commit". ' +
+                'Esta é uma configuração única no servidor do proxy.',
+              code: 'CERT_LEGACY_CIPHER',
+              bytesRecebidos: receivedByteLength,
+              bytesEsperados: pfxExpectedLength || receivedByteLength,
+              matchChecksum: matchChecksum,
+            }),
+          )
+        }
+
         const isMacOrPassword =
           lowerMsg.includes('mac') ||
           lowerMsg.includes('password') ||
@@ -575,6 +604,30 @@ function createProxyServer() {
             err && (err.message || err.code) ? String(err.message || err.code) : String(err)
           const lower = rawErr.toLowerCase()
 
+          // Precedência para cifra legada PKCS12 do OpenSSL 3
+          const isLegacyCipher =
+            lower.includes('unsupported pkcs12 pfx data') ||
+            lower.includes('unsupported pkcs12') ||
+            lower.includes('pkcs12 routines:pkcs12_pbe_crypt:unsupported') ||
+            lower.includes('pkcs12_pbe_crypt') ||
+            (lower.includes('unsupported') && lower.includes('pkcs12')) ||
+            (lower.includes('legacy') && lower.includes('provider'))
+
+          if (isLegacyCipher) {
+            return finishOnce(400, {
+              success: false,
+              error:
+                'O certificado digital A1 utiliza criptografia legada (RC2/3DES PBES1) que o OpenSSL 3 bloqueia por padrão. ' +
+                'Para resolver, acerte no Render.com: Settings → Environment → Add Environment Variable → ' +
+                'Name: NODE_OPTIONS | Value: --openssl-legacy-provider → Save Changes → Manual Deploy → "Deploy latest commit". ' +
+                'Esta é uma configuração única no servidor do proxy.',
+              code: 'CERT_LEGACY_CIPHER',
+              bytesRecebidos: receivedByteLength,
+              bytesEsperados: pfxExpectedLength || receivedByteLength,
+              matchChecksum: matchChecksum,
+            })
+          }
+
           let friendlyMsg = 'Erro na conexão mTLS com a SEFAZ: ' + rawErr
           let code = err.code || 'TLS_CONNECTION_ERROR'
           let httpStatus = 502
@@ -634,6 +687,31 @@ function createProxyServer() {
       } catch (execErr) {
         const rawMsg = execErr ? execErr.message || String(execErr) : 'Erro desconhecido'
         const lower = rawMsg.toLowerCase()
+
+        // Precedência para cifra legada PKCS12 do OpenSSL 3
+        const isLegacyCipher =
+          lower.includes('unsupported pkcs12 pfx data') ||
+          lower.includes('unsupported pkcs12') ||
+          lower.includes('pkcs12 routines:pkcs12_pbe_crypt:unsupported') ||
+          lower.includes('pkcs12_pbe_crypt') ||
+          (lower.includes('unsupported') && lower.includes('pkcs12')) ||
+          (lower.includes('legacy') && lower.includes('provider'))
+
+        if (isLegacyCipher) {
+          return finishOnce(400, {
+            success: false,
+            error:
+              'O certificado digital A1 utiliza criptografia legada (RC2/3DES PBES1) que o OpenSSL 3 bloqueia por padrão. ' +
+              'Para resolver, acerte no Render.com: Settings → Environment → Add Environment Variable → ' +
+              'Name: NODE_OPTIONS | Value: --openssl-legacy-provider → Save Changes → Manual Deploy → "Deploy latest commit". ' +
+              'Esta é uma configuração única no servidor do proxy.',
+            code: 'CERT_LEGACY_CIPHER',
+            bytesRecebidos: receivedByteLength,
+            bytesEsperados: pfxExpectedLength || receivedByteLength,
+            matchChecksum: matchChecksum,
+          })
+        }
+
         const isPassFail =
           lower.includes('mac') || lower.includes('password') || lower.includes('decrypt')
 
