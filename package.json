@@ -1,0 +1,15 @@
+{
+  "name": "sefaz-mtls-proxy",
+  "version": "1.0.0",
+  "description": "Micro-serviço Proxy mTLS Node.js para comunicação com a SEFAZ (NFeDistribuicaoDFe) com suporte a TLS Renegotiation e certificado A1",
+  "main": "sefaz-proxy-server.cjs",
+  "scripts": {
+    "start": "node sefaz-proxy-server.cjs"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "private": true,
+  "author": "Gestor de Notas Fiscais",
+  "license": "MIT"
+}
