@@ -535,21 +535,33 @@ function createProxyServer() {
       const postData = Buffer.from(soapBody, 'utf-8')
       const requestTimeoutMs = Math.max(5000, Math.min(Number(timeout) || 60000, 120000))
 
+      // Normaliza action oficial do WSDL NFeDistribuicaoDFe
+      const rawAction =
+        soapAction ||
+        'http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe/nfeDistDFeInteresse'
+      const cleanAction = rawAction.replace(/^"+|"+$/g, '')
+      const quotedAction = `"${cleanAction}"`
+
+      // No SOAP 1.2, o padrão W3C e IIS/SEFAZ aceita:
+      // Content-Type: application/soap+xml; charset=utf-8; action="http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe/nfeDistDFeInteresse"
+      // e também o header SOAPAction HTTP para retrocompatibilidade
+      const contentTypeWithAction = `application/soap+xml; charset=utf-8; action=${quotedAction}`
+
       // Cabeçalhos HTTP/1.1 para a SEFAZ
+      const requestHeaders = {
+        'Content-Type': contentTypeWithAction,
+        'Content-Length': postData.length,
+        Connection: 'close', // Garante HTTP/1.1 limpo
+        SOAPAction: quotedAction,
+        'User-Agent': 'GestorNFe-Node-mTLS-Proxy/2.0 (OpenSSL)',
+      }
+
       const requestOptions = {
         hostname: parsedUrl.hostname,
         port: parsedUrl.port ? Number(parsedUrl.port) : 443,
         path: parsedUrl.pathname + parsedUrl.search,
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/soap+xml; charset=utf-8',
-          'Content-Length': postData.length,
-          Connection: 'close', // Garante HTTP/1.1 limpo
-          SOAPAction:
-            soapAction ||
-            'http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe/nfeDistDFeInteresse',
-          'User-Agent': 'GestorNFe-Node-mTLS-Proxy/2.0 (OpenSSL)',
-        },
+        headers: requestHeaders,
         agent: agent,
         timeout: requestTimeoutMs,
       }
@@ -643,11 +655,16 @@ function createProxyServer() {
               }
             }
 
+            // Se a SEFAZ respondeu com statusCode HTTP >= 400 (ex: 400 Bad Request, 500 Internal Server Error, etc.)
+            // marcamos success: false e repassamos o body completo (SOAP Fault XML) para interpretação precisa no cliente
+            const isHttpSuccess = sefazRes.statusCode >= 200 && sefazRes.statusCode < 300
+
             finishOnce(200, {
-              success: true,
+              success: isHttpSuccess,
               statusCode: sefazRes.statusCode,
               headers: sefazRes.headers,
               body: responseBody,
+              raw: responseBody,
               docs: docs,
             })
           })
