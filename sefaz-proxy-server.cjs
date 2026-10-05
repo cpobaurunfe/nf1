@@ -29,6 +29,99 @@ const url = require('node:url')
 const PORT = Number(process.env.PORT) || 8080
 const PROXY_SECRET = process.env.PROXY_SECRET || process.env.SEFAZ_PROXY_SECRET || ''
 
+// Rate limiting simples em memória (30 requisições / minuto por IP)
+const rateLimitMap = new Map()
+const RATE_LIMIT_WINDOW_MS = 60 * 1000
+const RATE_LIMIT_MAX_REQUESTS = 30
+
+// Limpeza periódica do mapa de rate limiting a cada 5 minutos
+const rateLimitCleanupInterval = setInterval(
+  () => {
+    const now = Date.now()
+    for (const [ip, data] of rateLimitMap.entries()) {
+      if (now > data.resetAt) {
+        rateLimitMap.delete(ip)
+      }
+    }
+  },
+  5 * 60 * 1000,
+)
+if (rateLimitCleanupInterval.unref) rateLimitCleanupInterval.unref()
+
+/**
+ * Comparação em tempo constante de duas strings para prevenir timing attacks.
+ */
+function safeTimingCompare(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false
+  const bufA = Buffer.from(a, 'utf-8')
+  const bufB = Buffer.from(b, 'utf-8')
+  if (bufA.length !== bufB.length) {
+    // Garante tempo de comparação equivalente para comprimentos diferentes
+    crypto.timingSafeEqual(bufA, bufA)
+    return false
+  }
+  return crypto.timingSafeEqual(bufA, bufB)
+}
+
+/**
+ * Allowlist estrita de domínios oficiais da SEFAZ para NFe / DFe.
+ * Impede que o proxy seja utilizado como relay aberto para qualquer destino arbitrário da internet.
+ */
+const ALLOWED_SEFAZ_HOST_SUFFIXES = [
+  '.fazenda.gov.br', // Ambiente Nacional (www1.nfe.fazenda.gov.br, hom.nfe.fazenda.gov.br, etc.)
+  '.sefaz.sp.gov.br', // SEFAZ São Paulo (nfe.fazenda.sp.gov.br / sefaz.sp.gov.br)
+  '.fazenda.sp.gov.br',
+  '.fazenda.pr.gov.br', // SEFAZ Paraná
+  '.sefa.pa.gov.br', // SEFAZ Pará
+  '.sefaz.rs.gov.br', // SEFAZ Rio Grande do Sul (SVRS)
+  '.sefaz.mg.gov.br', // SEFAZ Minas Gerais
+  '.sefaz.ba.gov.br', // SEFAZ Bahia
+  '.sefaz.go.gov.br', // SEFAZ Goiás
+  '.sefaz.mt.gov.br', // SEFAZ Mato Grosso
+  '.sefaz.ms.gov.br', // SEFAZ Mato Grosso do Sul
+  '.sefaz.ce.gov.br', // SEFAZ Ceará
+  '.sefaz.pe.gov.br', // SEFAZ Pernambuco
+  '.sefazvirtual.fazenda.gov.br', // SVAN
+]
+
+const ALLOWED_EXACT_HOSTS = new Set([
+  'www1.nfe.fazenda.gov.br',
+  'hom.nfe.fazenda.gov.br',
+  'nfe.fazenda.gov.br',
+  'hom1.nfe.fazenda.gov.br',
+  'nfe.fazenda.sp.gov.br',
+  'homologacao.nfe.fazenda.sp.gov.br',
+  'nfe.sefaz.rs.gov.br',
+  'nfe-homologacao.sefaz.rs.gov.br',
+  'nfe.fazenda.pr.gov.br',
+  'homologacao.nfe.fazenda.pr.gov.br',
+  'nfe.sefaz.ba.gov.br',
+  'hnfe.sefaz.ba.gov.br',
+  'nfe.sefaz.go.gov.br',
+  'homolog.sefaz.go.gov.br',
+  'nfe.sefaz.mg.gov.br',
+  'hnfe.fazenda.mg.gov.br',
+  'nfe.sefaz.mt.gov.br',
+  'homologacao.sefaz.mt.gov.br',
+  'nfe.sefaz.ms.gov.br',
+  'hom.nfe.sefaz.ms.gov.br',
+])
+
+function isAllowedSefazHost(hostname) {
+  if (!hostname || typeof hostname !== 'string') return false
+  const host = hostname.toLowerCase().trim()
+
+  if (ALLOWED_EXACT_HOSTS.has(host)) return true
+
+  for (const suffix of ALLOWED_SEFAZ_HOST_SUFFIXES) {
+    if (host.endsWith(suffix)) {
+      return true
+    }
+  }
+
+  return false
+}
+
 /**
  * Cria a instância da aplicação HTTP/proxy.
  */
@@ -47,15 +140,13 @@ function createProxyServer() {
       return res.end()
     }
 
-    // Healthcheck endpoint
+    // Healthcheck endpoint mínimo (não expõe detalhes internos sensíveis)
     if (req.method === 'GET' && (req.url === '/' || req.url === '/health')) {
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
       return res.end(
         JSON.stringify({
           status: 'ok',
-          service: 'sefaz-mtls-proxy-node',
-          runtime: 'Node.js ' + process.version,
-          features: ['mTLS', 'PKCS12/PFX', 'TLSv1.2', 'HTTP/1.1', 'OpenSSL-Legacy-Renegotiation'],
+          service: 'sefaz-mtls-proxy',
           authRequired: Boolean(PROXY_SECRET),
           timestamp: new Date().toISOString(),
         }),
@@ -72,10 +163,43 @@ function createProxyServer() {
       )
     }
 
+    // Rate limiting em memória por IP (sem dependências externas)
+    // Janela deslizante de 60s, até 30 requisições por minuto por IP
+    const clientIp =
+      (req.headers['x-forwarded-for'] &&
+        String(req.headers['x-forwarded-for']).split(',')[0].trim()) ||
+      req.socket.remoteAddress ||
+      'unknown'
+    const nowTs = Date.now()
+    const rateWindow = rateLimitMap.get(clientIp)
+    if (!rateWindow || nowTs > rateWindow.resetAt) {
+      rateLimitMap.set(clientIp, { count: 1, resetAt: nowTs + RATE_LIMIT_WINDOW_MS })
+    } else {
+      rateWindow.count += 1
+      if (rateWindow.count > RATE_LIMIT_MAX_REQUESTS) {
+        res.writeHead(429, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Retry-After': Math.max(1, Math.ceil((rateWindow.resetAt - nowTs) / 1000)),
+        })
+        return res.end(
+          JSON.stringify({
+            success: false,
+            error:
+              'Limite de requisições excedido. Aguarde alguns instantes antes de tentar novamente.',
+            code: 'RATE_LIMIT_EXCEEDED',
+          }),
+        )
+      }
+    }
+
     // Validação de token de segurança compartilhado (quando configurado no servidor)
+    // Usa comparação em tempo constante para evitar timing attacks
     if (PROXY_SECRET) {
-      const providedSecret = req.headers['x-proxy-secret'] || req.headers['X-Proxy-Secret'] || ''
-      if (providedSecret !== PROXY_SECRET) {
+      const providedSecret = String(
+        req.headers['x-proxy-secret'] || req.headers['X-Proxy-Secret'] || '',
+      )
+      const secretMatches = safeTimingCompare(providedSecret, PROXY_SECRET)
+      if (!secretMatches) {
         res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' })
         return res.end(
           JSON.stringify({
@@ -126,6 +250,8 @@ function createProxyServer() {
         soapAction,
         soapBody,
         pfxBase64,
+        pfxExpectedLength,
+        pfxExpectedSha256,
         passphrase = '',
         timeout = 60000,
       } = payload || {}
@@ -161,7 +287,7 @@ function createProxyServer() {
         )
       }
 
-      // Decodificação do certificado PFX em Base64
+      // Decodificação do certificado PFX em Base64 e verificação de integridade no transporte
       let pfxBuffer
       try {
         const cleanBase64 = pfxBase64.replace(/\s+/g, '')
@@ -175,18 +301,116 @@ function createProxyServer() {
           JSON.stringify({
             success: false,
             error:
-              'Falha ao decodificar certificado A1 em Base64: arquivo corrompido ou formato inválido.',
+              'Arquivo do certificado ilegível ou corrompido no transporte. Formato Base64 inválido.',
+            code: 'CERT_CORRUPT',
+            bytesRecebidos: 0,
+            bytesEsperados: typeof pfxExpectedLength === 'number' ? pfxExpectedLength : null,
+            matchChecksum: false,
           }),
         )
       }
 
-      // Validação do endpoint de destino (protocolo HTTPS)
+      const receivedByteLength = pfxBuffer.length
+      const receivedSha256 = crypto.createHash('sha256').update(pfxBuffer).digest('hex')
+      let matchChecksum = true
+
+      if (
+        pfxExpectedLength &&
+        typeof pfxExpectedLength === 'number' &&
+        pfxExpectedLength !== receivedByteLength
+      ) {
+        matchChecksum = false
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' })
+        return res.end(
+          JSON.stringify({
+            success: false,
+            error: `Arquivo do certificado ilegível ou corrompido no transporte (recebidos ${receivedByteLength} bytes, esperados ${pfxExpectedLength} bytes).`,
+            code: 'CERT_CORRUPT',
+            bytesRecebidos: receivedByteLength,
+            bytesEsperados: pfxExpectedLength,
+            matchChecksum: false,
+          }),
+        )
+      }
+
+      if (pfxExpectedSha256 && typeof pfxExpectedSha256 === 'string') {
+        if (receivedSha256.toLowerCase() !== pfxExpectedSha256.toLowerCase()) {
+          matchChecksum = false
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' })
+          return res.end(
+            JSON.stringify({
+              success: false,
+              error: `Arquivo do certificado ilegível ou corrompido no transporte (divergência de checksum SHA-256).`,
+              code: 'CERT_CORRUPT',
+              bytesRecebidos: receivedByteLength,
+              bytesEsperados: pfxExpectedLength || receivedByteLength,
+              matchChecksum: false,
+            }),
+          )
+        }
+      }
+
+      // Verificação estrutural do cabeçalho ASN.1 DER (PKCS#12 / PFX)
+      // Todo arquivo DER PKCS#12 válido começa com SEQUENCE (0x30) e tem tamanho DER coerente
+      const isDerSequence = pfxBuffer[0] === 0x30
+      if (!isDerSequence) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' })
+        return res.end(
+          JSON.stringify({
+            success: false,
+            error: `Arquivo do certificado ilegível ou corrompido no transporte: estrutura ASN.1/DER inválida (esperava 0x30 SEQUENCE no início, recebeu 0x${pfxBuffer[0].toString(16)}).`,
+            code: 'CERT_CORRUPT',
+            bytesRecebidos: receivedByteLength,
+            bytesEsperados: pfxExpectedLength || receivedByteLength,
+            matchChecksum: matchChecksum,
+          }),
+        )
+      }
+
+      // Verificação de tamanho declarado no cabeçalho DER para detectar truncamento
+      let derDeclaredLength = 0
+      const secondByte = pfxBuffer[1]
+      let derHeaderOffset = 2
+      if (secondByte < 0x80) {
+        derDeclaredLength = secondByte
+      } else {
+        const numLenBytes = secondByte & 0x7f
+        derHeaderOffset = 2 + numLenBytes
+        if (numLenBytes <= 4 && pfxBuffer.length >= derHeaderOffset) {
+          for (let i = 0; i < numLenBytes; i++) {
+            derDeclaredLength = (derDeclaredLength << 8) | pfxBuffer[2 + i]
+          }
+        }
+      }
+
+      if (derDeclaredLength > 0) {
+        const totalExpectedDer = derHeaderOffset + derDeclaredLength
+        if (pfxBuffer.length < totalExpectedDer) {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' })
+          return res.end(
+            JSON.stringify({
+              success: false,
+              error: `Arquivo do certificado ilegível ou corrompido no transporte: truncado (${pfxBuffer.length} bytes recebidos vs ${totalExpectedDer} bytes declarados na estrutura DER).`,
+              code: 'CERT_CORRUPT',
+              bytesRecebidos: receivedByteLength,
+              bytesEsperados: totalExpectedDer,
+              matchChecksum: false,
+            }),
+          )
+        }
+      }
+
+      // Validação do endpoint de destino (protocolo HTTPS e ALLOWLIST rígida de domínios SEFAZ)
       let parsedUrl
       try {
         parsedUrl = new url.URL(targetUrl)
         if (parsedUrl.protocol !== 'https:') {
-          throw new Error(
-            'Apenas endpoints seguros (HTTPS) são aceitos para comunicação com a SEFAZ.',
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' })
+          return res.end(
+            JSON.stringify({
+              success: false,
+              error: 'Apenas endpoints seguros (HTTPS) são aceitos para comunicação com a SEFAZ.',
+            }),
           )
         }
       } catch (urlErr) {
@@ -195,6 +419,19 @@ function createProxyServer() {
           JSON.stringify({
             success: false,
             error: 'URL de destino inválida: ' + (urlErr.message || String(urlErr)),
+          }),
+        )
+      }
+
+      // Restrição de segurança: o proxy só pode se comunicar com servidores oficiais da SEFAZ
+      if (!isAllowedSefazHost(parsedUrl.hostname)) {
+        res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' })
+        return res.end(
+          JSON.stringify({
+            success: false,
+            error:
+              'Acesso negado: o destino solicitado não pertence à lista de webservices oficiais autorizados da SEFAZ.',
+            code: 'DESTINATION_NOT_ALLOWED',
           }),
         )
       }
@@ -221,20 +458,46 @@ function createProxyServer() {
       } catch (agentErr) {
         // Diagnóstico sem jamais expor passphrase ou certificado
         const rawMsg = agentErr ? agentErr.message || String(agentErr) : ''
+        const lowerMsg = rawMsg.toLowerCase()
         const isMacOrPassword =
-          rawMsg.toLowerCase().includes('mac') ||
-          rawMsg.toLowerCase().includes('pkcs12') ||
-          rawMsg.toLowerCase().includes('password') ||
-          rawMsg.toLowerCase().includes('passphrase')
+          lowerMsg.includes('mac') ||
+          lowerMsg.includes('password') ||
+          lowerMsg.includes('passphrase') ||
+          lowerMsg.includes('bad decrypt')
+
+        const isCorruptFormat =
+          lowerMsg.includes('asn1') ||
+          lowerMsg.includes('der') ||
+          lowerMsg.includes('nested asn1') ||
+          lowerMsg.includes('header too long') ||
+          lowerMsg.includes('length too long') ||
+          lowerMsg.includes('wrong tag')
+
+        if (isCorruptFormat) {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' })
+          return res.end(
+            JSON.stringify({
+              success: false,
+              error: `Arquivo do certificado ilegível ou corrompido no transporte (${receivedByteLength} bytes recebidos).`,
+              code: 'CERT_CORRUPT',
+              bytesRecebidos: receivedByteLength,
+              bytesEsperados: pfxExpectedLength || receivedByteLength,
+              matchChecksum: matchChecksum,
+            }),
+          )
+        }
 
         res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' })
         return res.end(
           JSON.stringify({
             success: false,
             error: isMacOrPassword
-              ? 'Senha incorreta do certificado digital A1 ou integridade PKCS#12 corrompida. Verifique a senha cadastrada.'
+              ? 'Senha do certificado incorreta'
               : 'Falha ao inicializar contexto TLS com o certificado A1 fornecido.',
-            code: 'CERT_INIT_ERROR',
+            code: isMacOrPassword ? 'CERT_INVALID_PASSPHRASE' : 'CERT_INIT_ERROR',
+            bytesRecebidos: receivedByteLength,
+            bytesEsperados: pfxExpectedLength || receivedByteLength,
+            matchChecksum: matchChecksum,
           }),
         )
       }
@@ -318,13 +581,19 @@ function createProxyServer() {
 
           if (
             lower.includes('mac verify failure') ||
-            lower.includes('pkcs12') ||
             lower.includes('bad decrypt') ||
             lower.includes('invalid password')
           ) {
-            friendlyMsg =
-              'Senha do certificado digital A1 incorreta ou arquivo PFX corrompido. Revise a senha salva em Configurações.'
+            friendlyMsg = 'Senha do certificado incorreta'
             code = 'CERT_INVALID_PASSPHRASE'
+            httpStatus = 400
+          } else if (
+            lower.includes('asn1') ||
+            lower.includes('nested') ||
+            lower.includes('wrong tag')
+          ) {
+            friendlyMsg = `Arquivo do certificado ilegível ou corrompido no transporte (${receivedByteLength} bytes recebidos).`
+            code = 'CERT_CORRUPT'
             httpStatus = 400
           } else if (
             lower.includes('handshake') ||
@@ -354,6 +623,9 @@ function createProxyServer() {
             success: false,
             error: friendlyMsg,
             code: code,
+            bytesRecebidos: receivedByteLength,
+            bytesEsperados: pfxExpectedLength || receivedByteLength,
+            matchChecksum: matchChecksum,
           })
         })
 
@@ -363,17 +635,26 @@ function createProxyServer() {
         const rawMsg = execErr ? execErr.message || String(execErr) : 'Erro desconhecido'
         const lower = rawMsg.toLowerCase()
         const isPassFail =
-          lower.includes('mac') ||
-          lower.includes('pkcs12') ||
-          lower.includes('password') ||
-          lower.includes('decrypt')
+          lower.includes('mac') || lower.includes('password') || lower.includes('decrypt')
 
-        finishOnce(isPassFail ? 400 : 500, {
+        const isCorrupt =
+          lower.includes('asn1') || lower.includes('der') || lower.includes('wrong tag')
+
+        finishOnce(isPassFail || isCorrupt ? 400 : 500, {
           success: false,
           error: isPassFail
-            ? 'Senha do certificado digital A1 incorreta ou integridade inválida.'
-            : 'Falha interna ao inicializar túnel mTLS: ' + rawMsg,
-          code: isPassFail ? 'CERT_INVALID_PASSPHRASE' : 'INTERNAL_PROXY_ERROR',
+            ? 'Senha do certificado incorreta'
+            : isCorrupt
+              ? `Arquivo do certificado ilegível ou corrompido no transporte (${receivedByteLength} bytes recebidos).`
+              : 'Falha interna ao inicializar túnel mTLS: ' + rawMsg,
+          code: isPassFail
+            ? 'CERT_INVALID_PASSPHRASE'
+            : isCorrupt
+              ? 'CERT_CORRUPT'
+              : 'INTERNAL_PROXY_ERROR',
+          bytesRecebidos: receivedByteLength,
+          bytesEsperados: pfxExpectedLength || receivedByteLength,
+          matchChecksum: matchChecksum,
         })
       }
     })
