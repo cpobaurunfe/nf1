@@ -542,20 +542,19 @@ function createProxyServer() {
       const cleanAction = rawAction.replace(/^"+|"+$/g, '')
       const quotedAction = `"${cleanAction}"`
 
-      // No SOAP 1.2, o padrão W3C e IIS/SEFAZ aceita:
+      // No SOAP 1.2, a especificação W3C e os servidores IIS/SEFAZ exigem:
       // Content-Type: application/soap+xml; charset=utf-8; action="http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe/nfeDistDFeInteresse"
-      // e também o header SOAPAction HTTP para retrocompatibilidade
+      // e também o header SOAPAction HTTP para máxima compatibilidade com gateways e WCF
       const contentTypeWithAction = `application/soap+xml; charset=utf-8; action=${quotedAction}`
 
       // Cabeçalhos HTTP/1.1 para a SEFAZ
       const requestHeaders = {
         'Content-Type': contentTypeWithAction,
         'Content-Length': postData.length,
-        Connection: 'close', // Garante HTTP/1.1 limpo
+        Connection: 'close', // Garante HTTP/1.1 limpo sem reuso de conexão que possa falhar mTLS
         SOAPAction: quotedAction,
         'User-Agent': 'GestorNFe-Node-mTLS-Proxy/2.0 (OpenSSL)',
       }
-
       const requestOptions = {
         hostname: parsedUrl.hostname,
         port: parsedUrl.port ? Number(parsedUrl.port) : 443,
@@ -581,14 +580,30 @@ function createProxyServer() {
 
       try {
         sefazReq = https.request(requestOptions, (sefazRes) => {
-          let responseBody = ''
-          sefazRes.setEncoding('utf-8')
+          const chunks = []
 
           sefazRes.on('data', (chunk) => {
-            responseBody += chunk
+            chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
           })
 
           sefazRes.on('end', () => {
+            const rawBuffer = Buffer.concat(chunks)
+            const responseBody = rawBuffer.toString('utf-8')
+
+            // Modo debug via variável de ambiente DEBUG_FAULT=1
+            const isDebug = process.env.DEBUG_FAULT === '1' || process.env.DEBUG === 'sefaz*'
+            if (isDebug || sefazRes.statusCode >= 400) {
+              const sanitizedSnippet = responseBody
+                .replace(/<[^>]+>/g, ' ')
+                .replace(/\s+/g, ' ')
+                .slice(0, 300)
+              console.error(
+                `[SEFAZ Proxy] Resposta HTTP ${sefazRes.statusCode} recebida (${rawBuffer.length} bytes). Amostra: ${sanitizedSnippet}`,
+              )
+              if (isDebug) {
+                console.error(`[SEFAZ Proxy DEBUG_FAULT] Corpo bruto:`, responseBody)
+              }
+            }
             // Se a resposta contiver docZip, descomprime cada um via zlib.gunzipSync
             const docs = []
             if (responseBody.includes('<docZip') || responseBody.includes(':docZip')) {
